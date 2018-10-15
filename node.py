@@ -3,8 +3,9 @@ import logging
 import argparse
 import yaml
 import time
-from random import random
+from random import random, randint
 from collections import Counter
+import json
 
 import asyncio
 import aiohttp
@@ -48,34 +49,41 @@ class MultiPaxosHandler:
 
         # learner
         self._sync_interval = conf['sync_interval']
-        self._learning = {} # s: Counter((n, v): cnt)
+        self._learning = {} # s: Counter(n: cnt)
         self._learned = [] # Bubble is represented by None
         self._learned_event = {} # s: event
  
         # -
         self._loss_rate = conf['loss%'] / 100
+        self._skip = conf['skip']
 
         # -
-        self._network_timeout = conf['misc']['request_timeout']
-        self._session = aiohttp.ClientSession(timeout=network_timeout)
+        self._network_timeout = conf['misc']['network_timeout']
+        self._session = None
+        self._log = logging.getLogger(__name__)
 
     @staticmethod
     def make_url(node, command):
-        return "http://{}:{}/{}".format(node['ip'], node['port'], method)
+        return "http://{}:{}/{}".format(node['host'], node['port'], command)
 
-    async def make_requests(self, nodes, command, json_data):
+    async def _make_requests(self, nodes, command, json_data):
         resp_list = []
         for i, node in enumerate(nodes):
             if random() > self._loss_rate:
+                if not self._session:
+                    timeout = aiohttp.ClientTimeout(self._network_timeout)
+                    self._session = aiohttp.ClientSession(timeout=timeout)
+                self._log.debug("make request to %d, %s", i, command)
                 try:
-                    async with session.post(self._make_url(node, command), json=json_data) as resp:
-                        resp_list.append((i, resp))
-                except:
+                    resp = await self._session.post(self.make_url(node, command), json=json_data)
+                    resp_list.append((i, resp))
+                except Exception as e:
                     #resp_list.append((i, e))
+                    self._log.error(e)
                     pass
         return resp_list 
 
-    async def make_response(self, resp):
+    async def _make_response(self, resp):
         '''
         Drop response by chance, via sleep for sometime.
         '''
@@ -83,7 +91,7 @@ class MultiPaxosHandler:
             await asyncio.sleep(self._network_timeout)
         return resp
 
-    async def elect(self, view_id):
+    async def _elect(self, view_id):
         '''
         Compete for election.
 
@@ -94,6 +102,8 @@ class MultiPaxosHandler:
             1. Initial heartbeat
             2. Accept!
         '''
+        self._log.info("---> %d: run election", self._ind)
+
         self._seq += 1
         self._n = (view_id, self._seq)
 
@@ -110,25 +120,34 @@ class MultiPaxosHandler:
                 'next_new_slot': len(self._learned),
                 }
 
-        resp_list = await make_requests(self._nodes, MultiPaxosHandler.PREPARE, json_data)
+        resp_list = await self._make_requests(self._nodes, MultiPaxosHandler.PREPARE, json_data)
 
         # Count vote
         count = 0
         nv_for_known_slots = {}
         for i, resp in resp_list:
             if resp.status == 499: #TODO, give up
+                self._log.warn("------> %d: give up on Nack", self._ind, i)
                 return
             if resp.status == 200:
-                json_data = await resp.json()
-                for s, (n, v) in json_data['known_slots']:
-                    if s in nv_for_known_slots:
-                        nv_for_known_slots[s] = max(nv_for_known_slots[s], (n,v), key = lambda x: x[0])
-                    else:
-                        nv_for_known_slots[s] = (n, v)
-                count += 1
+                try:
+                    json_data = await resp.json()
+                except:
+                    pass
+                else:
+                    for s, (n, v) in json_data['known_slots'].items():
+                        s = int(s)
+                        if s in nv_for_known_slots:
+                            nv_for_known_slots[s] = max(nv_for_known_slots[s], (n,v), key = lambda x: x[0])
+                        else:
+                            nv_for_known_slots[s] = (n, v)
+                    count += 1
+
+        self._log.info("------> %d: votes received %d", self._ind, count)
 
         # New leader now
         if count >= self._node_cnt // 2 + 1:
+            self._log.info("------> %d: become new leader", self._ind)
             self._is_leader = True
 
             # Catch up
@@ -154,9 +173,10 @@ class MultiPaxosHandler:
                     'proposal': proposal
                     }
 
-            resp_list = await make_requests(self._nodes, MultiPaxosHandler.ACCEPT, json_data)
+            resp_list = await self._make_requests(self._nodes, MultiPaxosHandler.ACCEPT, json_data)
             for i, resp in resp_list:
                 if resp.status == 499:
+                    self._log.warn("------> %d: give up on Nack", self._ind, i)
                     # step down
                     self._is_leader = False
                     return
@@ -164,14 +184,14 @@ class MultiPaxosHandler:
             # Initiate heartbeat!
             self._hb_server = asyncio.ensure_future(self._heartbeat_server())
 
-    async def heartbeat_server(self._:
+    async def _heartbeat_server(self):
         '''
         Send heartbeat to every node.
 
         If get 499 as Nack, step down.
         '''
         while True:
-            resp_list = await make_requests(self._nodes, MultiPaxosHandler.HEARTBEAT, { 'leader': self._ind, 'n': self._n })
+            resp_list = await self._make_requests(self._nodes, MultiPaxosHandler.HEARTBEAT, { 'leader': self._ind, 'n': self._n })
             for i, resp in resp_list:
                 if resp.status == 499:
                     # step down
@@ -180,7 +200,7 @@ class MultiPaxosHandler:
                     return
             await asyncio.sleep(self._heartbeat_interval)
 
-    async def heartbeat_observer(self._:
+    async def heartbeat_observer(self):
         '''
         Observe hearbeat: if timeout, run election if appropriate.
         '''
@@ -188,7 +208,8 @@ class MultiPaxosHandler:
             await asyncio.sleep(self._heartbeat_interval)
             cur_ts = time.time()
             if self._last_heartbeat < cur_ts - self._heartbeat_ttl:
-                view_id = cur_ts / self._election_slice
+                self._log.warn("---> %d: heartbeat missing", self._ind)
+                view_id = cur_ts // self._election_slice
                 if view_id % self._node_cnt == self._ind:
                     # run election
                     asyncio.ensure_future(self._elect(view_id))
@@ -212,7 +233,7 @@ class MultiPaxosHandler:
             self._leader = json_data['leader']
             self._last_heartbeat = time.time()
             code = 200
-        elif n_hb = self._n_promise:
+        elif n_hb == self._n_promise:
             self._last_heartbeat = time.time()
             code = 200
         else:
@@ -244,6 +265,8 @@ class MultiPaxosHandler:
             }
         }
         '''
+        self._log.info("---> %d: on prepare", self._ind)
+
         json_data = await request.json()
         n_prepare = tuple(json_data['n'])
         if n_prepare > self._n_promise: # Only Ack if n_prepare larger than the largest n ever seen.
@@ -256,14 +279,14 @@ class MultiPaxosHandler:
 
             known_slots = {}
             for b in bubble_slots:
-                if b in self._accept:
-                    known_slots[b] = self._accept[b]
+                if b in self._accepted:
+                    known_slots[b] = self._accepted[b]
                 elif b < len(self._learned) and self._learned[b]: # return learned value directly, fake `n`
                     known_slots[b] = (n_prepare, self._learned[b])
 
-            for b in self._accept:
+            for b in self._accepted:
                 if b >= next_new_slot:
-                    known_slots[b] = self._accept[b]
+                    known_slots[b] = self._accepted[b]
 
             for i in range(next_new_slot, len(self._learned)):
                 if self._learned[i]:
@@ -294,16 +317,19 @@ class MultiPaxosHandler:
 
         Make LEARN request to all nodes if accepted.
         '''
+        self._log.info("---> %d: on accept", self._ind)
+
         json_data = await request.json()
         n_accept = tuple(json_data['n'])
         if n_accept >= self._n_promise: # Only Accept if n_accept geq than the largest n ever seen.
             self._n_promise = n_accept
             self._leader = json_data['leader']
             proposal = json_data['proposal']
-            for s, v in proposal:
+            for s, v in proposal.items():
+                s = int(s)
                 if not s < len(self._learned) or not self._learned[s]:
                     self._accepted[s] = (n_accept, v)
-                asyncio.ensure(make_requests(self._nodes, MultiPaxosHandler.LEARN, { 'proposal': proposal }))
+                asyncio.ensure_future(self._make_requests(self._nodes, MultiPaxosHandler.LEARN, { 'n': n_accept, 'proposal': proposal }))
             ret = web.Response()
         else:
             ret = web.Response(status=499)
@@ -315,6 +341,7 @@ class MultiPaxosHandler:
         Learn request from nodes.
 
         {
+            n: 
             proposal: {
                 0: v,
                 3: v,
@@ -323,15 +350,18 @@ class MultiPaxosHandler:
 
         No response needed
         '''
+        self._log.info("---> %d: on learn", self._ind)
 
         json_data = await request.json()
         proposal = json_data['proposal']
-        for s, v in proposal:
+        n = tuple(json_data['n'])
+        for s, v in proposal.items():
+            s = int(s)
             if not s < len(self._learned) or not self._learned[s]:
                 if not s in self._learning:
                     self._learning[s] = Counter()
-                self._learning[s][(n,v)] += 1
-                if self._learning[s][(n,v)] >= self._node_cnt // 2 + 1:
+                self._learning[s][n] += 1
+                if self._learning[s][n] >= self._node_cnt // 2 + 1:
                     if not s < len(self._learned):
                         self._learned += [None] * (s + 1 - len(self._learned))
                     self._learned[s] = v
@@ -344,7 +374,7 @@ class MultiPaxosHandler:
 
         return await self._make_response(web.Response())
 
-    async def decision_synchronizer(self._:
+    async def decision_synchronizer(self):
         '''
         Sync with other learner periodically.
 
@@ -359,7 +389,7 @@ class MultiPaxosHandler:
         '''
         while True:
             await asyncio.sleep(self._sync_interval)
-            if not self._is_leader:
+            if not self._is_leader and self._leader != None:
                 # Only ask for things this learner doesn't know.
                 bubble_slots = []
                 for i, v in enumerate(self._learned):
@@ -374,18 +404,25 @@ class MultiPaxosHandler:
                 resp_list = await self._make_requests([self._nodes[self._leader]], MultiPaxosHandler.SYNC, json_data)
                 if not resp_list:
                     resp = resp_list[0]
-                    json_data = await resp.json()
-                    for s, v in json_data['known_slots']:
-                        if not s < len(self._learned):
-                            self._learned += [None] * (s + 1 - len(self._learned))
-                        self._learned[s] = v
-                        if s in self._learned_event:
-                            self._learned_event[s].set()
-                            del self._learned_event[s]
-                        if s in self._learning:
-                            del self._learning[s]
-                        if s in self._accepted:
-                            del self._accepted[s]
+                    try:
+                        json_data = await resp.json()
+                    except:
+                        pass
+                    else:
+                        for s, v in json_data['known_slots'].items():
+                            s = int(s)
+                            if not s < len(self._learned):
+                                self._learned += [None] * (s + 1 - len(self._learned))
+                            self._learned[s] = v
+                            if s in self._learned_event:
+                                self._learned_event[s].set()
+                                del self._learned_event[s]
+                            if s in self._learning:
+                                del self._learning[s]
+                            if s in self._accepted:
+                                del self._accepted[s]
+            with open(".{}.dump".format(self._ind), 'w') as f:
+                json.dump(self._learned, f)
 
     async def sync(self, request):
         '''
@@ -396,6 +433,8 @@ class MultiPaxosHandler:
             next_new_slot: 
         }
         '''
+        self._log.info("---> %d: on sync", self._ind)
+
         json_data = await request.json()
 
         bubble_slots = json_data['bubble_slots']
@@ -411,7 +450,7 @@ class MultiPaxosHandler:
 
         json_data = {'known_slots': known_slots}
         
-        return await make_response(web.json_response(json_data))
+        return await self._make_response(web.json_response(json_data))
 
     async def request(self, request):
         '''
@@ -424,40 +463,55 @@ class MultiPaxosHandler:
 
         Handle this if leader, otherwise redirect to leader
         '''
+        self._log.info("---> %d: on request", self._ind)
 
         json_data = await request.json()
         if not self._is_leader:
-            raise web.HTTPTemporaryRedirect(self._make_url(self._nodes[self._leader], MultiPaxosHandler.REQUEST))
+            if self._leader != None:
+                raise web.HTTPTemporaryRedirect(self.make_url(self._nodes[self._leader], MultiPaxosHandler.REQUEST))
+            else:
+                raise web.HTTPServiceUnavailable()
 
         this_slot = self._next_new_slot
-        self._next_new_slot += 1
+        if this_slot == self._skip:
+            this_slot += 1
+        self._next_new_slot = this_slot + 1
         proposal = {
                 'leader': self._ind,
                 'n': self._n,
                 'proposal': {
-                    this_slot: (json_data['id'], json_data['data'])
+                    this_slot: [json_data['id'], json_data['data']]
                     }
                 }
         if not this_slot in self._learned_event:
             self._learned_event[this_slot] = asyncio.Event()
         this_event = self._learned_event[this_slot]
 
-        resp_list = await make_requests(self._nodes, MultiPaxosHandler.ACCEPT, proposal)
+        resp_list = await self._make_requests(self._nodes, MultiPaxosHandler.ACCEPT, proposal)
         for i, resp in resp_list:
             if resp.status == 499:
+                self._log.warn("------> %d: give up on Nack", self._ind, i)
                 # step down
                 self._is_leader = False
                 if self._hb_server:
                     self._hb_server.cancel()
                     self._hb_server = None
-                raise web.HTTPTemporaryRedirect(self._make_url(self._nodes[self._leader], MultiPaxosHandler.REQUEST))
+                if self._leader != None and self._leader != self._ind:
+                    redirect = self._leader
+                else:
+                    redirect = i
+                raise web.HTTPTemporaryRedirect(self.make_url(self._nodes[redirect], MultiPaxosHandler.REQUEST))
 
         # respond only when learner learned the value
         await this_event.wait()
-        if self._learned[this_slot] == (json_data['id'], json_data['data']):
+        if self._learned[this_slot] == [json_data['id'], json_data['data']]:
             resp = web.Response()
         else:
-            raise web.HTTPTemporaryRedirect(self._make_url(self._nodes[self._leader], MultiPaxosHandler.REQUEST))
+            if self._leader != None and self._leader != self._ind:
+                redirect = self._leader
+            else:
+                redirect = randint(0, self._node_cnt-1)
+            raise web.HTTPTemporaryRedirect(self.make_url(self._nodes[redirect], MultiPaxosHandler.REQUEST))
 
         return await self._make_response(resp)
 
@@ -487,7 +541,7 @@ def arg_parse():
     # parse command line options
     parser = argparse.ArgumentParser(description='Multi-Paxos Node')
     parser.add_argument('-i', '--index', type=int, help='node index')
-    parser.add_argument('-c', '--config', default='/etc/paxos.yaml', type=argparse.FileType('r'), help='use configuration [%(default)s]')
+    parser.add_argument('-c', '--config', default='paxos.yaml', type=argparse.FileType('r'), help='use configuration [%(default)s]')
     args = parser.parse_args()
     return args
 
@@ -496,9 +550,9 @@ def conf_parse(conf_file) -> dict:
     Sample config:
 
     nodes:
-        - ip: 
+        - host: 
           port:
-        - ip:
+        - host:
           port:
 
     loss%:
@@ -514,7 +568,7 @@ def conf_parse(conf_file) -> dict:
     sync_interval: 10
 
     misc:
-        request_timeout: 10
+        network_timeout: 10
     '''
     conf = yaml.load(conf_file)
     return conf
@@ -524,8 +578,11 @@ def main():
     log = logging.getLogger()
     args = arg_parse()
     conf = conf_parse(args.config)
+    log.debug(conf)
 
-    host, port = conf['nodes'][args.index]
+    addr = conf['nodes'][args.index]
+    host = addr['host']
+    port = addr['port']
 
     paxos = MultiPaxosHandler(args.index, conf)
     asyncio.ensure_future(paxos.heartbeat_observer())
@@ -541,7 +598,7 @@ def main():
         web.post('/' + MultiPaxosHandler.REQUEST, paxos.request),
         ])
 
-    web.run_app(app, host=host, port=port)
+    web.run_app(app, host=host, port=port, access_log=None)
 
 
 if __name__ == "__main__":
