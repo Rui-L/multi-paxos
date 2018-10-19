@@ -1,4 +1,4 @@
-A simple Multi-Paxos protocol over HTTP.
+A simple Multi-Paxos protocol over HTTP, using python3 asyncio/aiohttp. This is just a proof of concept implementation, for my study of distributed systems, and also for me to not forget about asyncio.
 
 ## Configuration
 A `paxos.yaml` config file is needed for the nodes to run. A sample is as follows:
@@ -35,6 +35,10 @@ misc:
 
 ## Run the nodes
 `for i in {0..5}; do ./node.py -i $i &; done`
+
+## Send request to any one of the nodes
+e.g. `curl -vLX POST --data '{ "id": [0,0], "data": "helloworld"}' http://localhost:30000/request`
+The `id` here is a tuple of `(client_id, seq_id)`, `data` is whatever data in string format.
 
 ## Check the consistency
 `for i in .*.dump; do hash $i; done`
