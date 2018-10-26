@@ -29,13 +29,13 @@ class MultiPaxosHandler:
         self._me = self._nodes[ind]
         self._ind = ind
 
-        # leader election
+        ## leader election
         self._last_heartbeat = 0
         self._heartbeat_ttl = conf['heartbeat']['ttl']
         self._heartbeat_interval = conf['heartbeat']['interval']
         self._election_slice = conf['election_slice']
 
-        # leader
+        ## leader
         # view_id = cur_time // election_slice; seq = self._seq
         # (view_id, seq)
         self._n = (0, 0)
@@ -45,7 +45,7 @@ class MultiPaxosHandler:
         self._is_leader = False
         self._hb_server = None
 
-        # acceptor
+        ## acceptor
         # Indicate my current leader.
         self._leader = None
         ## better named n_promise_accept, the largest number either promised or accepted
@@ -53,7 +53,7 @@ class MultiPaxosHandler:
         self._n_promise = (0, 0)
         self._accepted = {} # s: (n, v)
 
-        # learner
+        ## learner
         self._sync_interval = conf['sync_interval']
         self._learning = {} # s: Counter(n: cnt)
         self._learned = [] # Bubble is represented by None
@@ -71,22 +71,64 @@ class MultiPaxosHandler:
         self._session = None
         self._log = logging.getLogger(__name__) 
 
+        ## Update timeout for thew network system
+        self._init_network_timeout = conf['misc']['network_timeout']
+        self._init_heartbeat_interval = conf['heartbeat']['ttl']
+        # Time record from send to ACK for last _numexec_time_records executions.
+        self._network_time_queue = []
+        self._num_exec_time_records = 100
+        self._last_session_create_time = time.time()
+
     @staticmethod
     def make_url(node, command):
         return "http://{}:{}/{}".format(node['host'], node['port'], command)
 
     async def _make_requests(self, nodes, command, json_data):
+        '''
+        Send json data and update network timeout:
+        For updating timeout:
+            (1) Timeout occur: timeout x 2 and update session with new timeout
+            (2) Receive feedback successfully: 
+                If len(queue) == 100: psuh new time into queue and pop the first element
+                else: push new time 
+                In the end, update timeout by the max(max(queue) x 2, init_timeout).
+            Besides, update the timeout of the session every 10 * timeout
+        
+        input:
+            nodes: list of dictionary with key: host, port
+            command: Command to execute.
+            json_data: Json data.
+        output:
+            list of tuple: (node_index, response)
+
+        '''
         resp_list = []
         for i, node in enumerate(nodes):
             if random() > self._loss_rate:
-                if not self._session:
+                if not self._session or (time.time() - self._last_session_create_time > 10 * self._network_timeout):
                     timeout = aiohttp.ClientTimeout(self._network_timeout)
                     self._session = aiohttp.ClientSession(timeout=timeout)
+                    self._last_session_create_time = time.time()
                 self._log.debug("make request to %d, %s", i, command)
                 try:
+                    sent_time = time.time()
                     resp = await self._session.post(self.make_url(node, command), json=json_data)
+                    new_interval = time.time() - sent_time
                     resp_list.append((i, resp))
+                    self._network_time_queue.append(new_interval)
+                    if len(self._network_time_queue) > self._num_exec_time_records:
+                       self._network_time_queue.pop(0) 
+                    if len(self._network_time_queue) > 1:
+                        self._network_timeout = max(2 * max(self._network_time_queue), self._init_network_timeout)
+                        self._heartbeat_ttl = 2 * self._network_timeout
+                    
                 except Exception as e:
+                    self._network_timeout *= 2
+                    self._heartbeat_ttl = 2 * self._network_timeout
+                    self._network_time_queue = []
+                    timeout = aiohttp.ClientTimeout(self._network_timeout)
+                    self._session = aiohttp.ClientSession(timeout=timeout)
+                    self._log.warn("------> %d: Face timeout, timeout change to %d", self._ind, self._network_timeout)
                     #resp_list.append((i, e))
                     self._log.error(e)
                     pass
@@ -217,8 +259,11 @@ class MultiPaxosHandler:
         while True:
             await asyncio.sleep(self._heartbeat_interval)
             cur_ts = time.time()
-            if self._last_heartbeat < cur_ts - self._heartbeat_ttl:
-                self._log.warn("---> %d: heartbeat missing", self._ind)
+            if self._last_heartbeat < cur_ts - self._heartbeat_ttl: 
+                # Miss heartbeat also double timeout
+                self._network_timeout *= 2
+                self._heartbeat_ttl = 2 * self._network_timeout
+                self._log.warn("---> %d: heartbeat missing, update timeout to %d", self._ind, self._network_timeout)
                 view_id = cur_ts // self._election_slice
                 if view_id % self._node_cnt == self._ind:
                     # run election
@@ -376,7 +421,8 @@ class MultiPaxosHandler:
                         self._learned += [None] * (s + 1 - len(self._learned))
                     self._learned[s] = v
                     # Delete useless info after learn the given slot.
-                    del self._learning[s]
+                    if s in self._learning:
+                        del self._learning[s]
                     if s in self._accepted:
                         del self._accepted[s]
             
@@ -402,6 +448,7 @@ class MultiPaxosHandler:
         '''
         while True:
             await asyncio.sleep(self._sync_interval)
+            self._log.info("%d:  Start synchronizing.", self._ind)
             if not self._is_leader and self._leader != None:
                 # Only ask for things this learner doesn't know.
                 bubble_slots = []
@@ -417,7 +464,10 @@ class MultiPaxosHandler:
 
                 # Leader nodehas the most updated information. As a result,
                 # only need to update learned result with leader node.
+                self._log.debug("%d:  Start asking filling the bubble.", self._ind)
+                
                 resp_list = await self._make_requests([self._nodes[self._leader]], MultiPaxosHandler.SYNC, json_data)
+                self._log.debug("%d:  Receive bubble filling message.", self._ind)
                 if resp_list:
                     resp = resp_list[0][1]
                     try:
@@ -428,12 +478,13 @@ class MultiPaxosHandler:
                     else:
                         for s, v in json_data['known_slots'].items():
                             s = int(s)
-                            self._log.info("%d: Update bubble %d by decision synchrosizer.", self._ind, s)
+                            self._log.debug("%d: Update bubble %d by decision synchrosizer.", self._ind, s)
                             if not s < len(self._learned):
                                 self._learned += [None] * (s + 1 - len(self._learned))
                             self._learned[s] = v
                             # Delete useless info after learn the given slot.
-                            del self._learning[s]
+                            if s in self._learning:
+                                del self._learning[s]
                             if s in self._accepted:
                                 del self._accepted[s]
                             # Once the former are all executed(Without bubble), we send ACK to the client of given slot. 
@@ -442,7 +493,7 @@ class MultiPaxosHandler:
                                     self._learned_event[self._accumulate_commit].set()
                                     del self._learned_event[self._accumulate_commit]
                                 self._accumulate_commit += 1
-            self._log.info("%d: accumlate commit: %d" , self._ind, self._accumulate_commit)
+            self._log.info("%d: accumulate commit: %d" , self._ind, self._accumulate_commit)
             
             with open("{}.dump".format(self._ind), 'w') as f:
                 json.dump(self._learned[:self._accumulate_commit], f)
@@ -568,6 +619,7 @@ def arg_parse():
     parser = argparse.ArgumentParser(description='Multi-Paxos Node')
     parser.add_argument('-i', '--index', type=int, help='node index')
     parser.add_argument('-c', '--config', default='paxos.yaml', type=argparse.FileType('r'), help='use configuration [%(default)s]')
+    parser.add_argument('-lf', '--log_to_file', default=False, type=bool, help='Whether to dump log messages to file, default = False')
     args = parser.parse_args()
     return args
 
@@ -600,8 +652,11 @@ def conf_parse(conf_file) -> dict:
     return conf
 
 def main():
-    logging_config()
     args = arg_parse()
+    if args.log_to_file:
+        logging.basicConfig(filename='log_' + str(args.index),
+                            filemode='a', level=logging.DEBUG)
+    logging_config()
     log = logging.getLogger()
     conf = conf_parse(args.config)
     log.debug(conf)
