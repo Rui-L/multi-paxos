@@ -40,5 +40,8 @@ misc:
 e.g. `curl -vLX POST --data '{ "id": [0,0], "data": "helloworld"}' http://localhost:30000/request`
 The `id` here is a tuple of `(client_id, seq_id)`, `data` is whatever data in string format.
 
+## Run the clients
+for i in {0...3}; do python client.py -id $i -nm 15 &; done
+
 ## Check the consistency
 `for i in .*.dump; do hash $i; done`

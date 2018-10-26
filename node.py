@@ -6,6 +6,7 @@ import time
 from random import random, randint
 from collections import Counter
 import json
+import sys
 
 import asyncio
 import aiohttp
@@ -35,15 +36,20 @@ class MultiPaxosHandler:
         self._election_slice = conf['election_slice']
 
         # leader
+        # view_id = cur_time // election_slice; seq = self._seq
+        # (view_id, seq)
         self._n = (0, 0)
+        # Accumulated number of total proposals proposed by the given node
         self._seq = 0
         self._next_new_slot = 0
         self._is_leader = False
         self._hb_server = None
 
         # acceptor
+        # Indicate my current leader.
         self._leader = None
         ## better named n_promise_accept, the largest number either promised or accepted
+        # Same format as self._n. Indicate current view and leader's sequence
         self._n_promise = (0, 0)
         self._accepted = {} # s: (n, v)
 
@@ -52,6 +58,9 @@ class MultiPaxosHandler:
         self._learning = {} # s: Counter(n: cnt)
         self._learned = [] # Bubble is represented by None
         self._learned_event = {} # s: event
+
+        # Number of commit accumulated.
+        self._accumulate_commit = 0
  
         # -
         self._loss_rate = conf['loss%'] / 100
@@ -60,7 +69,7 @@ class MultiPaxosHandler:
         # -
         self._network_timeout = conf['misc']['network_timeout']
         self._session = None
-        self._log = logging.getLogger(__name__)
+        self._log = logging.getLogger(__name__) 
 
     @staticmethod
     def make_url(node, command):
@@ -192,6 +201,7 @@ class MultiPaxosHandler:
         '''
         while True:
             resp_list = await self._make_requests(self._nodes, MultiPaxosHandler.HEARTBEAT, { 'leader': self._ind, 'n': self._n })
+            
             for i, resp in resp_list:
                 if resp.status == 499:
                     # step down
@@ -365,13 +375,16 @@ class MultiPaxosHandler:
                     if not s < len(self._learned):
                         self._learned += [None] * (s + 1 - len(self._learned))
                     self._learned[s] = v
-                    if s in self._learned_event:
-                        self._learned_event[s].set()
-                        del self._learned_event[s]
+                    # Delete useless info after learn the given slot.
                     del self._learning[s]
                     if s in self._accepted:
                         del self._accepted[s]
-
+            
+                    while self._accumulate_commit < len(self._learned) and self._learned[self._accumulate_commit] != None:
+                        if self._accumulate_commit in self._learned_event:
+                            self._learned_event[self._accumulate_commit].set()
+                            del self._learned_event[self._accumulate_commit]
+                        self._accumulate_commit += 1
         return await self._make_response(web.Response())
 
     async def decision_synchronizer(self):
@@ -394,6 +407,7 @@ class MultiPaxosHandler:
                 bubble_slots = []
                 for i, v in enumerate(self._learned):
                     if v == None:
+                        self._log.info("%d: with bubble at slot %d.", self._ind, i)
                         bubble_slots.append(i)
 
                 json_data = {
@@ -401,28 +415,37 @@ class MultiPaxosHandler:
                         'next_new_slot': len(self._learned),
                         }
 
+                # Leader nodehas the most updated information. As a result,
+                # only need to update learned result with leader node.
                 resp_list = await self._make_requests([self._nodes[self._leader]], MultiPaxosHandler.SYNC, json_data)
-                if not resp_list:
-                    resp = resp_list[0]
+                if resp_list:
+                    resp = resp_list[0][1]
                     try:
                         json_data = await resp.json()
                     except:
+                        self._log.info("%d: Bad known slot message.", self._ind)
                         pass
                     else:
                         for s, v in json_data['known_slots'].items():
                             s = int(s)
+                            self._log.info("%d: Update bubble %d by decision synchrosizer.", self._ind, s)
                             if not s < len(self._learned):
                                 self._learned += [None] * (s + 1 - len(self._learned))
                             self._learned[s] = v
-                            if s in self._learned_event:
-                                self._learned_event[s].set()
-                                del self._learned_event[s]
-                            if s in self._learning:
-                                del self._learning[s]
+                            # Delete useless info after learn the given slot.
+                            del self._learning[s]
                             if s in self._accepted:
                                 del self._accepted[s]
-            with open(".{}.dump".format(self._ind), 'w') as f:
-                json.dump(self._learned, f)
+                            # Once the former are all executed(Without bubble), we send ACK to the client of given slot. 
+                            while self._accumulate_commit < len(self._learned) and self._learned[self._accumulate_commit] != None:
+                                if self._accumulate_commit in self._learned_event:
+                                    self._learned_event[self._accumulate_commit].set()
+                                    del self._learned_event[self._accumulate_commit]
+                                self._accumulate_commit += 1
+            self._log.info("%d: accumlate commit: %d" , self._ind, self._accumulate_commit)
+            
+            with open("{}.dump".format(self._ind), 'w') as f:
+                json.dump(self._learned[:self._accumulate_commit], f)
 
     async def sync(self, request):
         '''
@@ -443,10 +466,11 @@ class MultiPaxosHandler:
         known_slots = {}
         for b in bubble_slots:
             if b < len(self._learned) and self._learned[b]:
-                known_slots[b] = self._learned[b]
+                known_slots[str(b)] = self._learned[b]
+                self._log.info("%d: Fill bubble %d by sync.", self._ind, b)
         for i in range(next_new_slot, len(self._learned)):
             if self._learned[i]:
-                known_slots[i] = self._learned[i]
+                known_slots[str(i)] = self._learned[i]
 
         json_data = {'known_slots': known_slots}
         
@@ -490,7 +514,7 @@ class MultiPaxosHandler:
         resp_list = await self._make_requests(self._nodes, MultiPaxosHandler.ACCEPT, proposal)
         for i, resp in resp_list:
             if resp.status == 499:
-                self._log.warn("------> %d: give up on Nack", self._ind, i)
+                self._log.warn("------> %d: give up on Nack from %d", self._ind, i)
                 # step down
                 self._is_leader = False
                 if self._hb_server:
@@ -504,6 +528,8 @@ class MultiPaxosHandler:
 
         # respond only when learner learned the value
         await this_event.wait()
+        resp = web.Response()
+        
         if self._learned[this_slot] == [json_data['id'], json_data['data']]:
             resp = web.Response()
         else:
@@ -512,7 +538,7 @@ class MultiPaxosHandler:
             else:
                 redirect = randint(0, self._node_cnt-1)
             raise web.HTTPTemporaryRedirect(self.make_url(self._nodes[redirect], MultiPaxosHandler.REQUEST))
-
+        
         return await self._make_response(resp)
 
 
@@ -575,8 +601,8 @@ def conf_parse(conf_file) -> dict:
 
 def main():
     logging_config()
-    log = logging.getLogger()
     args = arg_parse()
+    log = logging.getLogger()
     conf = conf_parse(args.config)
     log.debug(conf)
 
